@@ -31,434 +31,48 @@ def thermal_module():
     yield thermal
 
 
-class TestPIDController:
-    """Test class for PIDController functionality."""
+# PIDController lives in sonic-platform-common and is unit-tested there in
+# tests/pid_controller_test.py; only this platform's use of it is tested below.
+
+
+class TestFanDrawerConditions:
+    """Fan drawer presence conditions used to gate the thermal policies."""
 
     @pytest.fixture
-    def pid_controller(self, thermal_actions_module):
-        """Fixture providing a PIDController instance for testing."""
-        return thermal_actions_module.PIDController(
-            domain="test_domain",
-            interval=5,
-            proportional_gain=2.0,
-            integral_gain=0.5,
-            derivative_gain=0.1,
-            output_min=30.0,
-            output_max=100.0
-        )
+    def conditions_module(self):
+        from sonic_platform import thermal_conditions
 
-    def _calculate_expected_output(self, kp, ki, kd, proportional, integral, derivative, output_min, output_max):
-        """
-        Calculate expected PID output with saturation.
+        return thermal_conditions
 
-        Args:
-            kp, ki, kd: PID gains
-            proportional, integral, derivative: PID terms
-            output_min, output_max: Output limits
+    def _info(self, num_present):
+        from sonic_platform.thermal_infos import FanDrawerInfo
 
-        Returns:
-            Expected output value after saturation
-        """
-        raw_output = kp * proportional + ki * integral + kd * derivative
-        return max(output_min, min(output_max, raw_output))
+        info = Mock()
+        info.get_num_present_fan_drawers.return_value = num_present
+        return {FanDrawerInfo.INFO_TYPE: info}
 
-    def _calculate_initial_integral(self, output_min, output_max, ki):
-        """Calculate the pre-seeded integral value."""
-        return (output_min + output_max) / 2 / ki
-
-    def _check_anti_windup_condition(self, output, error, output_min, output_max):
-        """
-        Check if integral should be updated based on anti-windup logic.
-
-        Returns:
-            True if integral should be updated, False if frozen
-        """
-        return (output <= output_max or error < 0) and (output >= output_min or error > 0)
-
-    def test_pid_controller_initialization(self, pid_controller):
-        """Test PID controller initialization with various parameters."""
-        assert pid_controller._domain == "test_domain"
-        assert pid_controller._interval == 5
-        assert pid_controller._kp == 2.0
-        assert pid_controller._ki == 0.5
-        assert pid_controller._kd == 0.1
-        assert pid_controller._output_min == 30.0
-        assert pid_controller._output_max == 100.0
-        assert pid_controller._first_run is True
-        assert pid_controller._prev_error == 0.0
-        # Integral should be pre-seeded to midpoint
-        expected_integral = (30.0 + 100.0) / 2 / 0.5  # (min + max) / 2 / Ki
-        assert pid_controller._integral == expected_integral
-
-    @pytest.mark.parametrize("kp,ki,kd,output_min,output_max", [
-        (2.0, 1.0, 0.5, 20.0, 90.0),
-        (0.5, 0.1, 0.05, 40.0, 100.0),
-        (1.5, 2.0, 1.0, 30.0, 80.0),
+    @pytest.mark.parametrize("num_present,expected", [
+        (0, True), (1, True), (2, True), (3, False), (4, False),
     ])
-    def test_pid_controller_custom_parameters(self, thermal_actions_module, kp, ki, kd, output_min, output_max):
-        """Test PID controller initialization with various parameter combinations."""
-        controller = thermal_actions_module.PIDController(
-            domain="custom_domain",
-            interval=10,
-            proportional_gain=kp,
-            integral_gain=ki,
-            derivative_gain=kd,
-            output_min=output_min,
-            output_max=output_max
-        )
-
-        assert controller._kp == kp
-        assert controller._ki == ki
-        assert controller._kd == kd
-        assert controller._output_min == output_min
-        assert controller._output_max == output_max
-
-    def test_pid_controller_compute_first_run(self, pid_controller):
-        """Test PID controller computation on first run with mathematical validation."""
-        error = 5.0
-        kp, ki, kd = 2.0, 0.5, 0.1
-        interval = 5
-        output_min, output_max = 30.0, 100.0
-
-        # Calculate expected values using helper methods
-        initial_integral = self._calculate_initial_integral(output_min, output_max, ki)
-        proportional = error
-        derivative = 0.0  # First run
-        integral_calculation = initial_integral + error * interval
-
-        expected_output = self._calculate_expected_output(
-            kp, ki, kd, proportional, integral_calculation, derivative, output_min, output_max
-        )
-
-        output = pid_controller.compute(error)
-
-        # Verify exact calculation - no tolerance for error
-        assert output == expected_output, f"Expected {expected_output}, got {output}"
-
-        # Verify state changes
-        assert pid_controller._first_run is False
-        assert pid_controller._prev_error == error
-
-        # Check integral anti-windup logic
-        should_update_integral = self._check_anti_windup_condition(
-            expected_output, error, output_min, output_max
-        )
-        if should_update_integral:
-            assert pid_controller._integral == integral_calculation, \
-                f"Expected integral {integral_calculation}, got {pid_controller._integral}"
-        else:
-            assert pid_controller._integral == initial_integral, \
-                f"Expected integral {initial_integral}, got {pid_controller._integral}"
-
-    def test_pid_controller_compute_subsequent_runs(self, pid_controller):
-        """Test PID controller computation on subsequent runs with mathematical validation."""
-        # First run
-        error1 = 5.0
-        output1 = pid_controller.compute(error1)
-
-        # Second run calculation
-        error2 = 8.0
-        kp, ki, kd = 2.0, 0.5, 0.1
-        interval = 5
-        output_min, output_max = 30.0, 100.0
-
-        # State after first run
-        prev_integral = pid_controller._integral
-
-        proportional = error2
-        derivative = (error2 - error1) / interval
-        integral_calculation = prev_integral + error2 * interval
-
-        expected_output = self._calculate_expected_output(
-            kp, ki, kd, proportional, integral_calculation, derivative, output_min, output_max
-        )
-
-        output2 = pid_controller.compute(error2)
-
-        # Verify exact calculation (accounting for saturation)
-        assert output2 == expected_output, f"Expected {expected_output}, got {output2}"
-
-        # Verify state is updated
-        assert pid_controller._prev_error == error2
-        assert pid_controller._first_run is False
-
-    def test_pid_controller_output_saturation(self, pid_controller):
-        """Test PID controller output saturation validation."""
-        output_min, output_max = 30.0, 100.0
-
-        # Test saturation to maximum
-        large_error = 50.0
-
-        # Run multiple times to build up integral
-        for i in range(5):
-            output = pid_controller.compute(large_error)
-            if i == 4:  # Last iteration
-                # Should be saturated to max
-                assert output == output_max, f"Expected saturation to {output_max}, got {output}"
-
-        # Reset controller for minimum saturation test
-        pid_controller_min = pid_controller.__class__(
-            domain="test_domain",
-            interval=5,
-            proportional_gain=2.0,
-            integral_gain=0.5,
-            derivative_gain=0.1,
-            output_min=output_min,
-            output_max=output_max
-        )
-
-        # Test saturation to minimum
-        large_negative_error = -50.0
-
-        # Run multiple times to reduce integral
-        for i in range(5):
-            output = pid_controller_min.compute(large_negative_error)
-            if i == 4:  # Last iteration
-                # Should be saturated to min
-                assert output == output_min, f"Expected saturation to {output_min}, got {output}"
-
-    def test_pid_controller_integral_anti_windup(self, pid_controller):
-        """Test integral anti-windup mechanism validation."""
-        output_max = 100.0
-        large_error = 100.0
-
-        # First run to establish baseline
-        output1 = pid_controller.compute(large_error)
-        integral_after_first = pid_controller._integral
-
-        # Second run - should saturate and freeze integral
-        output2 = pid_controller.compute(large_error)
-        integral_after_second = pid_controller._integral
-
-        # Both outputs should be saturated to max
-        assert output1 == output_max, f"First output should be saturated to {output_max}, got {output1}"
-        assert output2 == output_max, f"Second output should be saturated to {output_max}, got {output2}"
-
-        # When saturated, integral should be frozen (anti-windup)
-        # The anti-windup condition should prevent integral from growing
-        # Since we have large positive error and saturated output, integral should be frozen
-        assert integral_after_second == integral_after_first, \
-            f"Integral should be frozen due to anti-windup: {integral_after_first} vs {integral_after_second}"
-
-    def test_pid_controller_zero_error_steady_state(self, pid_controller):
-        """Test PID controller behavior with zero error (steady state)."""
-        error = 0.0
-        kp, ki, kd = 2.0, 0.5, 0.1
-        output_min, output_max = 30.0, 100.0
-
-        # Calculate expected values using helper methods
-        initial_integral = self._calculate_initial_integral(output_min, output_max, ki)
-        proportional = error
-        derivative = 0.0  # First run
-        integral_after = initial_integral + error * 5  # No change with zero error
-
-        expected_output = self._calculate_expected_output(
-            kp, ki, kd, proportional, integral_after, derivative, output_min, output_max
-        )
-
-        output = pid_controller.compute(error)
-
-        assert output == expected_output, f"Expected {expected_output}, got {output}"
-
-    def test_pid_controller_oscillating_error(self, pid_controller):
-        """Test PID controller with oscillating error pattern."""
-        errors = [5.0, -3.0, 7.0, -2.0, 4.0]
-        outputs = []
-
-        for i, error in enumerate(errors):
-            output = pid_controller.compute(error)
-            outputs.append(output)
-
-            # Verify output is always within bounds
-            assert 30.0 <= output <= 100.0, f"Output {output} out of bounds at step {i}"
-
-        # Verify derivative calculation for second run
-        # derivative = (errors[1] - errors[0]) / interval = (-3.0 - 5.0) / 5 = -1.6
-        # This should contribute to reducing the output
-        assert outputs[1] < outputs[0], "Negative derivative should reduce output"
-
-    def test_pid_controller_step_response(self, pid_controller):
-        """Test PID controller step response with precise validation."""
-        # Step input: sudden change from 0 to 10
-        step_error = 10.0
-
-        # First run with step
-        output1 = pid_controller.compute(step_error)
-
-        # Calculate expected first response
-        kp, ki, kd = 2.0, 0.5, 0.1
-        initial_integral = (30.0 + 100.0) / 2 / ki  # 130.0
-
-        proportional = step_error  # 10.0
-        derivative = 0.0  # First run
-        integral = initial_integral + step_error * 5  # 130.0 + 50.0 = 180.0
-
-        expected_output1 = kp * proportional + ki * integral + kd * derivative
-        expected_output1 = 2.0 * 10.0 + 0.5 * 180.0 + 0.1 * 0.0  # 20.0 + 90.0 + 0.0 = 110.0
-
-        # Should be saturated to max
-        assert output1 == 100.0, f"Step response should saturate to 100.0, got {output1}"
-
-        # Second run with same error (steady state)
-        output2 = pid_controller.compute(step_error)
-
-        # Should still be saturated
-        assert output2 == 100.0, f"Continued step should remain saturated, got {output2}"
-
-    def test_pid_controller_zero_gains(self, thermal_actions_module):
-        """Test PID controller with zero gains (except integral to avoid division by zero)."""
-        # Create controller with zero proportional and derivative gains, small integral gain
-        controller = thermal_actions_module.PIDController(
-            domain="zero_test",
-            interval=5,
-            proportional_gain=0.0,
-            integral_gain=0.001,  # Small but non-zero to avoid division by zero
-            derivative_gain=0.0,
-            output_min=30.0,
-            output_max=100.0
-        )
-
-        error = 10.0
-        output = controller.compute(error)
-
-        # With zero Kp and Kd, output should be driven only by integral term
-        # Initial integral = (30 + 100) / 2 / 0.001 = 65000
-        # After first run: integral = 65000 + 10 * 5 = 65050 (integral is updated)
-        # Output = 0 * 10 + 0.001 * 65050 + 0 * 0 = 65.05
-        expected_output = 0.001 * (65000 + 10 * 5)  # 65.05
-        assert output == expected_output, f"Zero Kp/Kd should result in integral-driven output {expected_output}, got {output}"
-
-    def test_pid_controller_very_small_interval(self, thermal_actions_module):
-        """Test PID controller with very small interval."""
-        controller = thermal_actions_module.PIDController(
-            domain="small_interval_test",
-            interval=0.1,  # Very small interval
-            proportional_gain=1.0,
-            integral_gain=0.1,
-            derivative_gain=0.01,
-            output_min=30.0,
-            output_max=100.0
-        )
-
-        # First run
-        error1 = 5.0
-        output1 = controller.compute(error1)
-
-        # Second run - derivative should be large due to small interval
-        error2 = 6.0
-        output2 = controller.compute(error2)
-
-        # Derivative = (6.0 - 5.0) / 0.1 = 10.0
-        # This should significantly affect the output
-        derivative_contribution = 0.01 * 10.0  # 0.1
-
-        # Verify both outputs are within bounds
-        assert 30.0 <= output1 <= 100.0
-        assert 30.0 <= output2 <= 100.0
-
-    def test_pid_controller_large_interval(self, thermal_actions_module):
-        """Test PID controller with large interval."""
-        controller = thermal_actions_module.PIDController(
-            domain="large_interval_test",
-            interval=100,  # Very large interval
-            proportional_gain=1.0,
-            integral_gain=0.1,
-            derivative_gain=1.0,
-            output_min=30.0,
-            output_max=100.0
-        )
-
-        # First run
-        error1 = 5.0
-        output1 = controller.compute(error1)
-
-        # Second run - derivative should be small due to large interval
-        error2 = 10.0
-        output2 = controller.compute(error2)
-
-        # Derivative = (10.0 - 5.0) / 100 = 0.05
-        derivative_contribution = 1.0 * 0.05  # 0.05
-
-        # Verify both outputs are within bounds
-        assert 30.0 <= output1 <= 100.0
-        assert 30.0 <= output2 <= 100.0
-
-    def test_pid_controller_extreme_output_limits(self, thermal_actions_module):
-        """Test PID controller with extreme output limits."""
-        # Very narrow range
-        controller_narrow = thermal_actions_module.PIDController(
-            domain="narrow_test",
-            interval=5,
-            proportional_gain=1.0,
-            integral_gain=0.1,
-            derivative_gain=0.01,
-            output_min=49.9,
-            output_max=50.1
-        )
-
-        error = 1.0
-        output = controller_narrow.compute(error)
-
-        # Should be within the narrow range
-        assert 49.9 <= output <= 50.1, f"Output {output} outside narrow range [49.9, 50.1]"
-
-        # Very wide range
-        controller_wide = thermal_actions_module.PIDController(
-            domain="wide_test",
-            interval=5,
-            proportional_gain=1.0,
-            integral_gain=0.1,
-            derivative_gain=0.01,
-            output_min=0.0,
-            output_max=1000.0
-        )
-
-        error = 1.0
-        output_wide = controller_wide.compute(error)
-
-        # Should be within the wide range
-        assert 0.0 <= output_wide <= 1000.0, f"Output {output_wide} outside wide range [0.0, 1000.0]"
-
-    def test_pid_controller_floating_point_arithmetic(self, thermal_actions_module):
-        """Test PID controller with floating point arithmetic."""
-        kp, ki, kd = 1.234567, 0.987654, 0.123456
-        output_min, output_max = 25.5, 95.7
-        interval = 3
-
-        controller = thermal_actions_module.PIDController(
-            domain="precision_test",
-            interval=interval,
-            proportional_gain=kp,
-            integral_gain=ki,
-            derivative_gain=kd,
-            output_min=output_min,
-            output_max=output_max
-        )
-
-        # Use precise floating point values
-        error1 = 3.141592653589793
-
-        # Calculate expected values using helper methods
-        initial_integral = self._calculate_initial_integral(output_min, output_max, ki)
-        proportional = error1
-        derivative = 0.0  # First run
-        integral = initial_integral + error1 * interval
-
-        expected_output = self._calculate_expected_output(
-            kp, ki, kd, proportional, integral, derivative, output_min, output_max
-        )
-
-        output1 = controller.compute(error1)
-
-        # Verify exact calculation - no tolerance for error
-        assert output1 == expected_output, f"Expected {expected_output}, got {output1}"
-
-        # Second run with different precise value
-        error2 = 2.718281828459045
-        output2 = controller.compute(error2)
-
-        # Verify output is within bounds
-        assert output_min <= output2 <= output_max, f"Output {output2} outside bounds [{output_min}, {output_max}]"
+    def test_two_or_fewer_present(self, conditions_module, num_present, expected):
+        """Must include zero present, which the exact-count conditions leave unmatched."""
+        condition = conditions_module.FanDrawerTwoOrFewerPresentCondition()
+        assert condition.is_match(self._info(num_present)) is expected
+
+    @pytest.mark.parametrize("num_present,expected", [
+        (2, False), (3, True), (4, True),
+    ])
+    def test_default_operation_is_the_complement(self, conditions_module, num_present, expected):
+        condition = conditions_module.ThermalControlAlgorithmCondition()
+        assert condition.is_match(self._info(num_present)) is expected
+
+    @pytest.mark.parametrize("num_present", [0, 1, 2, 3, 4])
+    def test_every_drawer_count_is_covered(self, conditions_module, num_present):
+        """No drawer count may fall through both gates without an action."""
+        degraded = conditions_module.FanDrawerTwoOrFewerPresentCondition()
+        normal = conditions_module.ThermalControlAlgorithmCondition()
+        info = self._info(num_present)
+        assert degraded.is_match(info) or normal.is_match(info)
 
 
 class TestFanSetSpeedAction:
@@ -647,12 +261,21 @@ class TestThermalControlAlgorithmAction:
         assert controller._interval == 5
 
     def test_thermal_control_action_interval_mismatch(self, thermal_control_action, valid_json_config):
-        """Test that mismatched intervals raise ValueError."""
+        """A mismatched interval must warn, not abort: aborting drives the fans to 100%."""
         thermal_control_action.load_from_json(valid_json_config)
 
-        # Try to initialize with different interval
-        with pytest.raises(ValueError, match="Interval 10 does not match interval 5"):
-            thermal_control_action._initialize_pid_controllers(interval=10, fan_max_speed=100)
+        thermal_control_action._initialize_pid_controllers(interval=10, fan_max_speed=100)
+
+        assert 'cpu' in thermal_control_action._pidControllers
+
+    def test_thermal_control_action_preserves_midpoint_operating_point(
+            self, thermal_control_action, valid_json_config):
+        """This platform's gains are tuned around the midpoint of the usable fan range."""
+        thermal_control_action.load_from_json(valid_json_config)
+        thermal_control_action._initialize_pid_controllers(interval=5, fan_max_speed=100)
+
+        controller = thermal_control_action._pidControllers['cpu']
+        assert controller.compute(0.0) == (30 + 100) / 2
 
     def test_thermal_control_action_convert_pid_output_to_speed(self, thermal_control_action, valid_json_config):
         """Test PID output to fan speed conversion with precise validation."""

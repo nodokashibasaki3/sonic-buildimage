@@ -15,6 +15,18 @@ class FanDrawerCondition(ThermalPolicyConditionBase):
         """
         return thermal_info_dict.get(FanDrawerInfo.INFO_TYPE)
 
+@thermal_json_object('fandrawer.two.or.fewer.present')
+class FanDrawerTwoOrFewerPresentCondition(FanDrawerCondition):
+    """
+    Condition if two or fewer fan drawers are present, i.e. cooling is degraded.
+
+    Unlike the exact-count conditions below this covers the zero-present case, so
+    pairing it with 'default.operation' leaves no drawer count unhandled.
+    """
+    def is_match(self, thermal_info_dict: dict) -> bool:
+        fan_drawer_info = self.get_fan_drawer_info(thermal_info_dict)
+        return fan_drawer_info.get_num_present_fan_drawers() <= 2
+
 @thermal_json_object('fandrawer.one.present')
 class FanDrawerOnePresentCondition(FanDrawerCondition):
     """

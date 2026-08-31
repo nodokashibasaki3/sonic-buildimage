@@ -3,12 +3,14 @@
 # Copyright 2025 Nexthop Systems Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import time
 import traceback
 
 from typing import TYPE_CHECKING, Dict, List, Optional, Any, Union
 
 from sonic_platform_base.sonic_thermal_control.thermal_action_base import ThermalPolicyActionBase
 from sonic_platform_base.sonic_thermal_control.thermal_json_object import thermal_json_object
+from sonic_platform_base.sonic_thermal_control.pid_controller import PIDController
 
 if TYPE_CHECKING:
     from sonic_platform_base.fan_base import Fan
@@ -19,6 +21,17 @@ from sonic_platform.syslog import SYSLOG_IDENTIFIER_THERMAL, NhLoggerMixin
 # Default range of fan speed (percentage) that PID controller can produce.
 FAN_MIN_SPEED: float = 30.0
 FAN_MAX_SPEED: float = 100.0
+
+
+class _PidLogAdapter:
+    """Adapts NhLoggerMixin to the logger interface PIDController expects."""
+
+    def __init__(self, owner: NhLoggerMixin, domain: str) -> None:
+        self._owner = owner
+        self._domain = domain
+
+    def debug(self, msg: str, *args: Any) -> None:
+        self._owner.log_debug(f"[{self._domain}] " + (msg % args if args else msg))
 
 class FanException(Exception):
     """Base exception class for fan-related errors."""
@@ -169,6 +182,7 @@ class ThermalControlAlgorithmAction(ThermalPolicyActionBase, NhLoggerMixin):
         self._fan_limits: Optional[Dict[str, Union[int, float]]] = None
         self._pidControllers: Dict[str, 'PIDController'] = {}
         self._extra_setpoint_margin: Dict[str, float] = {}
+        self._last_run_timestamp: Optional[float] = None
 
         self.log_debug("Initialized")
 
@@ -238,8 +252,12 @@ class ThermalControlAlgorithmAction(ThermalPolicyActionBase, NhLoggerMixin):
             self.log_error(f"Exception executing thermal control algorithm: {e}")
             self.log_error(f"Traceback:\n{traceback.format_exc()}")
             self.log_error(f"Setting fan speed to {FAN_MAX_SPEED}% (max)")
-            self._set_all_fan_speeds(thermal_info_dict, FAN_MAX_SPEED)
-            raise
+            try:
+                self._set_all_fan_speeds(thermal_info_dict, FAN_MAX_SPEED)
+            except Exception as fan_exc:
+                self.log_error(f"Failed to apply fail-safe fan speed: {fan_exc}")
+            # Not re-raised: nothing up the stack handles it, so propagating would abort
+            # every remaining policy for this iteration.
 
     def _execute_raise_on_error(self, thermal_info_dict: Dict[str, Any]) -> None:
         """
@@ -260,8 +278,14 @@ class ThermalControlAlgorithmAction(ThermalPolicyActionBase, NhLoggerMixin):
 
         # Initialize PID controllers if needed
         if not self._pidControllers:
-            dt = thermal_info.get_thermal_manager().get_interval()
-            self._initialize_pid_controllers(dt, fan_max_speed)
+            interval = thermal_info.get_thermal_manager().get_interval()
+            self._initialize_pid_controllers(interval, fan_max_speed)
+
+        # The loop period is not guaranteed to equal the configured interval, so measure
+        # it once per pass and share it across domains.
+        now = time.monotonic()
+        dt = None if self._last_run_timestamp is None else now - self._last_run_timestamp
+        self._last_run_timestamp = now
 
         # Get all thermals and group by PID domain
         thermals = thermal_info.get_thermals()
@@ -269,13 +293,10 @@ class ThermalControlAlgorithmAction(ThermalPolicyActionBase, NhLoggerMixin):
 
         # Compute PID output for each domain
         pid_outputs = {}
-        max_error_thermals = {}
         for domain, domain_thermal_list in domain_thermals.items():
-            pid_output, max_error_thermal = self._compute_domain_pid_output(
-                domain, domain_thermal_list, fan_max_speed
+            pid_outputs[domain], _ = self._compute_domain_pid_output(
+                domain, domain_thermal_list, fan_max_speed, dt
             )
-            pid_outputs[domain] = pid_output
-            max_error_thermals[domain] = max_error_thermal.get_name() if max_error_thermal else "None"
 
         if not pid_outputs:
             raise ValueError("No valid PID outputs computed, keeping current fan speeds")
@@ -300,23 +321,28 @@ class ThermalControlAlgorithmAction(ThermalPolicyActionBase, NhLoggerMixin):
         Args:
             interval: Control loop interval in seconds
             fan_max_speed: Maximum fan speed in percentage (0-100)
-
-        Raises:
-            ValueError: If interval doesn't match configuration
         """
         if interval != self._constants['interval']:
-            # PID parameters are tuned for specific intervals
-            raise ValueError(f"Interval {interval} does not match interval {self._constants.get('interval')} "
-                             f"specified in JSON policy file")
+            # Only a tuning concern: compute() is given the measured elapsed time, and
+            # raising here would abort the action and drive the fans to 100%.
+            self.log_warning(
+                f"Manager interval {interval}s does not match interval "
+                f"{self._constants.get('interval')}s in the JSON policy file; "
+                "PID gains were tuned for the latter"
+            )
         for domain, domain_config in self._pidDomains.items():
+            output_min = self._fan_limits.get('min', FAN_MIN_SPEED)
             controller = PIDController(
-                domain=domain,
+                kp=domain_config['KP'],
+                ki=domain_config['KI'],
+                kd=domain_config['KD'],
+                output_min=output_min,
+                output_max=fan_max_speed,
                 interval=interval,
-                proportional_gain=domain_config['KP'],
-                integral_gain=domain_config['KI'],
-                derivative_gain=domain_config['KD'],
-                output_min=self._fan_limits.get('min', FAN_MIN_SPEED),
-                output_max=fan_max_speed
+                # This platform's gains are tuned around the midpoint of the fan range.
+                setpoint_output=(output_min + fan_max_speed) / 2,
+                name=f"pid[{domain}]",
+                logger=_PidLogAdapter(self, domain),
             )
             self._pidControllers[domain] = controller
             self._extra_setpoint_margin[domain] = domain_config.get('extra_setpoint_margin', 0)
@@ -355,7 +381,8 @@ class ThermalControlAlgorithmAction(ThermalPolicyActionBase, NhLoggerMixin):
         return domain_thermals
 
     def _compute_domain_pid_output(
-        self, domain: str, domain_thermals: List[Any], fan_max_speed: float
+        self, domain: str, domain_thermals: List[Any], fan_max_speed: float,
+        dt: Optional[float] = None
     ) -> tuple[float, Any]:
         """
         Compute PID output using thermal with largest error in domain.
@@ -364,14 +391,22 @@ class ThermalControlAlgorithmAction(ThermalPolicyActionBase, NhLoggerMixin):
             domain: PID domain name
             domain_thermals: List of thermal objects in this domain
             fan_max_speed: Maximum fan speed in percentage (0-100)
+            dt: Measured seconds since the previous pass, or None on the first pass
 
         Returns:
             Tuple of (PID output value, max error thermal object)
         """
         controller = self._pidControllers[domain]
 
-        # Fan's max speed limit can change at runtime, so update it first
-        controller.set_output_max(fan_max_speed)
+        # Fan's max speed limit can change at runtime, so update it first. A cap below
+        # the configured minimum would invert the range.
+        if fan_max_speed >= controller.output_min:
+            controller.set_output_limits(output_max=fan_max_speed)
+        else:
+            self.log_error(
+                f"Domain '{domain}': fan max speed {fan_max_speed} is below the "
+                f"configured minimum {controller.output_min}; keeping previous limit"
+            )
 
         # Find thermal with largest error (current temp - setpoint)
         max_error = None
@@ -405,7 +440,7 @@ class ThermalControlAlgorithmAction(ThermalPolicyActionBase, NhLoggerMixin):
                        f"with error {max_error:.2f}°C (setpoint={max_error_thermal_setpoint:.2f}°C)")
 
         # Compute PID output using the largest error
-        pid_output = controller.compute(max_error)
+        pid_output = controller.compute(max_error, dt)
         return pid_output, max_error_thermal
 
     def _convert_pid_output_to_speed(self, pid_output: float, max_speed: float) -> float:
@@ -457,114 +492,3 @@ class ThermalControlAlgorithmAction(ThermalPolicyActionBase, NhLoggerMixin):
             speed: Target fan speed percentage
         """
         set_all_fan_speeds(self, thermal_info_dict.get(FanDrawerInfo.INFO_TYPE).get_fans(), speed)
-
-class PIDController(NhLoggerMixin):
-    def __init__(self,
-                 domain: str,
-                 interval: int,
-                 proportional_gain: float,
-                 integral_gain: float,
-                 derivative_gain: float,
-                 output_min: float,
-                 output_max: float) -> None:
-        """
-        Initialize PID controller.
-
-        Args:
-            domain: Thermal domain name for logging
-            interval: Control loop interval in seconds
-            proportional_gain: Kp gain
-            integral_gain: Ki gain
-            derivative_gain: Kd gain
-            output_min: Minimum output value (fan speed %)
-            output_max: Maximum output value (fan speed %)
-        """
-        super().__init__(SYSLOG_IDENTIFIER_THERMAL)
-
-        self._domain = domain
-        self._interval = interval
-
-        # Gains
-        self._kp = proportional_gain
-        self._ki = integral_gain
-        self._kd = derivative_gain
-
-        self._output_min = output_min
-        self._output_max = output_max
-
-        # PID state variables
-        # Pre-seed integral to adjust to the midpoint between min/max
-        # This helps reduce the initial transient response
-        self._integral = (output_min + output_max) / 2 / self._ki
-        self._prev_error: float = 0
-        self._first_run: bool = True
-        self._last_output: float = (output_min + output_max) / 2  # Start at midpoint
-        self._in_deadband: bool = False
-
-        self.log_info(f"PIDController initialized for domain '{domain}': "
-                      f"gains=[Kp={proportional_gain}, Ki={integral_gain}, Kd={derivative_gain}], "
-                      f"output_range=[{output_min}, {output_max}], interval={interval}s")
-
-    def log(self, priority: Any, msg: str, also_print_to_console: bool = False) -> None:
-        super().log(priority, f"[{self._domain}] {msg}", also_print_to_console)
-
-    def set_output_max(self, output_max: float) -> None:
-        """Updates the maximum output value (fan speed %) as this can change at runtime."""
-        if output_max < self._output_min:
-            self.log_error(
-                f"PIDController for domain '{self._domain}': "
-                f"attempting to set output_max={output_max}, "
-                f"which is below output_min={self._output_min}. "
-                f"Ignoring."
-            )
-            return
-        self._output_max = output_max
-        self.log_info(f"PIDController for domain '{self._domain}': updated output_range=[{self._output_min}, {self._output_max}]")
-
-    def compute(self, error: float) -> float:
-        """
-        Compute PID output.
-
-        Args:
-            error: Current error value (measured_value - setpoint)
-
-        Returns:
-            Saturated PID controller output
-        """
-        debug_params_strings = []
-        kp, ki, kd = self._kp, self._ki, self._kd
-
-        # Proportional term - current error
-        proportional = error
-
-        # Derivative term - rate of change of error
-        if self._first_run:
-            derivative = 0.0
-            self._first_run = False
-        else:
-            derivative = (error - self._prev_error) / self._interval
-            
-        # Integral term - accumulated error over time
-        integral = self._integral + error * self._interval
-        
-        # Calculate output
-        output = kp * proportional + ki * integral + kd * derivative
-        saturated_output = max(self._output_min, min(self._output_max, output))
-        if saturated_output != output:
-            debug_params_strings.append("output saturated")
-        
-        # Save state for next iteration
-        # Only update integral if output is not saturated or if the error is helping to unsaturate
-        self._prev_error = error
-        if (output <= self._output_max or error < 0) and (output >= self._output_min or error > 0):
-            self._integral = integral
-        else:
-            debug_params_strings.append("integral frozen")
-
-        # Debug logging
-        log_str = f"PID=[ %8.3f %8.3f %8.3f ]   =>   OUT=%8.3f" % (proportional, integral, derivative, output)
-        if debug_params_strings:
-            log_str += f"   ({', '.join(debug_params_strings)})"
-        self.log_debug(log_str)
-
-        return saturated_output
