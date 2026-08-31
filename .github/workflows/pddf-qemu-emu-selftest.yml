@@ -1,0 +1,57 @@
+name: pddf-qemu-emu self-test
+
+# Exercises the xiic-fpga-i2c QEMU device change end-to-end WITHOUT building a
+# full SONiC image: builds QEMU from tools/pddf-qemu-emu/patches/qemu/, then
+# boots a prebuilt SONiC bring-up guest (fixtures) that drives the real
+# multifpgapci / i2c-xiic stack against the emulated FPGA and reads an emulated
+# I2C EEPROM + temp sensor. Passes when the guest prints "RESULT: PASS".
+
+on:
+  push:
+    paths:
+      - 'tools/pddf-qemu-emu/**'
+      - 'platform/pddf/i2c/modules/multifpgapci/**'
+      - 'platform/pddf/i2c/modules/include/pddf_multifpgapci*'
+      - '.github/workflows/pddf-qemu-emu-selftest.yml'
+  pull_request:
+    paths:
+      - 'tools/pddf-qemu-emu/**'
+      - 'platform/pddf/i2c/modules/multifpgapci/**'
+      - 'platform/pddf/i2c/modules/include/pddf_multifpgapci*'
+      - '.github/workflows/pddf-qemu-emu-selftest.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: pddf-qemu-emu-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      QEMU_REF: v11.1.0-rc1
+      QEMU_SRC: ${{ github.workspace }}/tools/pddf-qemu-emu/test/qemu
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install QEMU build + runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git ninja-build meson pkg-config ccache python3 python3-venv \
+            build-essential flex bison \
+            libglib2.0-dev libpixman-1-dev zlib1g-dev libslirp-dev
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ runner.os }}-qemu-${{ env.QEMU_REF }}-${{ hashFiles('tools/pddf-qemu-emu/patches/qemu/*.patch') }}
+          restore-keys: ccache-${{ runner.os }}-qemu-${{ env.QEMU_REF }}-
+
+      - name: Run emulator self-test (builds QEMU from patches, then boots guest)
+        run: |
+          chmod +x tools/pddf-qemu-emu/test/run-selftest.sh
+          tools/pddf-qemu-emu/test/run-selftest.sh

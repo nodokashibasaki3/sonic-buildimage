@@ -1,0 +1,523 @@
+From 378d822fcf0830019f86da2811a2366e6c885341 Mon Sep 17 00:00:00 2001
+From: Nodoka Shibasaki <nodokaorganized@gmail.com>
+Date: Wed, 22 Jul 2026 22:33:40 +0000
+Subject: [PATCH 1/2] hw/i2c: add xlnx-axi-iic, a Xilinx AXI IIC controller
+
+Add a model of the AMD/Xilinx AXI IIC controller (LogiCORE IP, PG090),
+an I2C bus controller. QEMU has no AXI IIC model today; this lets a guest
+driver for it, and the I2C slaves behind it, be exercised without real
+hardware.
+
+The device is a SysBus device: it owns one I2C bus, decodes the AXI IIC
+register map, implements the controller's dynamic transfer mode, and
+drives a single level-triggered interrupt line while DGIER is enabled and
+IISR & IIER is set. It has a reset handler and migration state, and a
+register-level specification in docs/specs/xlnx-axi-iic.rst.
+
+Signed-off-by: Nodoka Shibasaki <nodokaorganized@gmail.com>
+---
+ MAINTAINERS                   |  10 ++
+ docs/specs/index.rst          |   1 +
+ docs/specs/xlnx-axi-iic.rst   |  62 ++++++++
+ hw/i2c/Kconfig                |   4 +
+ hw/i2c/meson.build            |   1 +
+ hw/i2c/xlnx-axi-iic.c         | 284 ++++++++++++++++++++++++++++++++++
+ include/hw/i2c/xlnx-axi-iic.h |  69 +++++++++
+ 7 files changed, 431 insertions(+)
+ create mode 100644 docs/specs/xlnx-axi-iic.rst
+ create mode 100644 hw/i2c/xlnx-axi-iic.c
+ create mode 100644 include/hw/i2c/xlnx-axi-iic.h
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index a28935c898..8339c9bf83 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -2158,6 +2158,16 @@ S: Maintained
+ F: hw/misc/edu.c
+ F: docs/specs/edu.rst
+ 
++<<<<<<< Updated upstream
++=======
++xiic-fpga-i2c
++M: Nodoka Shibasaki <nodokaorganized@gmail.com>
++S: Maintained
++F: hw/i2c/xlnx-axi-iic.c
++F: include/hw/i2c/xlnx-axi-iic.h
++F: docs/specs/xlnx-axi-iic.rst
++
++>>>>>>> Stashed changes
+ IDE
+ M: John Snow <jsnow@redhat.com>
+ L: qemu-block@nongnu.org
+diff --git a/docs/specs/index.rst b/docs/specs/index.rst
+index b7909a108a..41b45a5be4 100644
+--- a/docs/specs/index.rst
++++ b/docs/specs/index.rst
+@@ -40,3 +40,4 @@ guest hardware that is specific to QEMU.
+    riscv-aia
+    aspeed-intc
+    iommu-testdev
++   xlnx-axi-iic
+diff --git a/docs/specs/xlnx-axi-iic.rst b/docs/specs/xlnx-axi-iic.rst
+new file mode 100644
+index 0000000000..a19b479522
+--- /dev/null
++++ b/docs/specs/xlnx-axi-iic.rst
+@@ -0,0 +1,62 @@
++.. SPDX-License-Identifier: GPL-2.0-or-later
++
++Xilinx AXI IIC device
++======================
++
++``xlnx-axi-iic`` models the AMD/Xilinx AXI IIC (LogiCORE IP, documented in
++Xilinx PG090) I2C bus controller. It is a SysBus device: a board or a parent
++device maps its single MMIO region and connects its interrupt line, and I2C
++slave models are attached to the ``i2c`` bus it creates.
++
++The model implements the controller's *dynamic* transfer mode, which is what
++a guest driver uses by default.
++
++Properties
++----------
++
++``bus-name``
++  Name given to the I2C bus the controller creates (default ``i2c``). A parent
++  device that instantiates several controllers uses this to give each bus a
++  unique, user-referenceable name.
++
++MMIO register map
++-----------------
++
++Offsets are relative to the start of the controller's MMIO region.
++
++  0x1C (RW) : DGIER, global interrupt enable (bit 31)
++  0x20 (RW) : IISR, interrupt status; write-1-to-clear
++  0x28 (RW) : IIER, interrupt enable
++  0x40 (WO) : RESETR, soft reset (write 0xA)
++  0x100 (RW) : CR, control
++  0x104 (RO) : SR, status (computed)
++  0x108 (WO) : DTR, tx data and dynamic START (bit 8) / STOP (bit 9)
++  0x10C (RO) : DRR, rx data
++  0x114 (RO) : TFO, tx FIFO occupancy (always 0; the FIFO drains immediately)
++  0x118 (RO) : RFO, rx FIFO occupancy
++  0x120 (RW) : RFD, rx FIFO programmable depth
++
++Status register (SR) bits: 0x04 bus busy, 0x20 rx FIFO full, 0x40 rx FIFO
++empty, 0x80 tx FIFO empty. Interrupt (IISR/IIER) bits: 0x01 arbitration lost,
++0x02 tx error / NACK, 0x04 tx FIFO empty, 0x08 rx FIFO full, 0x10 bus-not-busy.
++
++Dynamic-mode transfers
++----------------------
++
++The low 8 bits of a DTR write are the data byte; bit 8 (START) frames the
++8-bit address (bit 0 is the read/write flag) that opens a transfer, and bit 9
++(STOP) ends it.
++
++- Write: DTR <- addr|START, then each data byte, the last with STOP.
++- Read: DTR <- addr|START (read flag set), then DTR <- count|STOP. The
++  controller clocks ``count`` bytes from the slave into the rx FIFO, raises
++  IISR.RX_FULL, and raises IISR.BNB once the FIFO has been drained through DRR.
++
++A slave that does not acknowledge sets IISR.TX_ERROR and releases the bus.
++
++Interrupt
++---------
++
++The controller drives a single level-triggered output line, asserted while
++DGIER is enabled and ``IISR & IIER`` is non-zero, and deasserted when the guest
++clears the pending, enabled causes.
+diff --git a/hw/i2c/Kconfig b/hw/i2c/Kconfig
+index 0766130b59..4faf2bda99 100644
+--- a/hw/i2c/Kconfig
++++ b/hw/i2c/Kconfig
+@@ -43,6 +43,10 @@ config ALLWINNER_I2C
+     bool
+     select I2C
+ 
++config XLNX_AXI_IIC
++    bool
++    select I2C
++
+ config PCA954X
+     bool
+     select I2C
+diff --git a/hw/i2c/meson.build b/hw/i2c/meson.build
+index 88aea35662..939f02f03b 100644
+--- a/hw/i2c/meson.build
++++ b/hw/i2c/meson.build
+@@ -9,6 +9,7 @@ i2c_ss.add(when: 'CONFIG_EXYNOS4', if_true: files('exynos4210_i2c.c'))
+ i2c_ss.add(when: 'CONFIG_IMX_I2C', if_true: files('imx_i2c.c'))
+ i2c_ss.add(when: 'CONFIG_MPC_I2C', if_true: files('mpc_i2c.c'))
+ i2c_ss.add(when: 'CONFIG_ALLWINNER_I2C', if_true: files('allwinner-i2c.c'))
++i2c_ss.add(when: 'CONFIG_XLNX_AXI_IIC', if_true: files('xlnx-axi-iic.c'))
+ i2c_ss.add(when: 'CONFIG_NRF51_SOC', if_true: files('microbit_i2c.c'))
+ i2c_ss.add(when: 'CONFIG_NPCM7XX', if_true: files('npcm7xx_smbus.c'))
+ i2c_ss.add(when: 'CONFIG_DESIGNWARE_I2C', if_true: files('designware_i2c.c'))
+diff --git a/hw/i2c/xlnx-axi-iic.c b/hw/i2c/xlnx-axi-iic.c
+new file mode 100644
+index 0000000000..c27398c319
+--- /dev/null
++++ b/hw/i2c/xlnx-axi-iic.c
+@@ -0,0 +1,284 @@
++/*
++ * xlnx-axi-iic.c - QEMU model of the Xilinx AXI IIC (LogiCORE IP) controller.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++#include "migration/vmstate.h"
++#include "hw/core/irq.h"
++#include "hw/core/sysbus.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/i2c/xlnx-axi-iic.h"
++
++static bool xlnx_axi_iic_pending(XlnxAxiIicState *s)
++{
++    if (!(s->dgier & XLNX_AXI_IIC_GINTR_ENABLE_MASK)) {
++        return false;
++    }
++    return (s->isr & s->ier) != 0;
++}
++
++static void xlnx_axi_iic_update_irq(XlnxAxiIicState *s)
++{
++    qemu_set_irq(s->irq, xlnx_axi_iic_pending(s));
++}
++
++static void xlnx_axi_iic_reset_regs(XlnxAxiIicState *s)
++{
++    if (s->in_xfer) {
++        i2c_end_transfer(s->bus);
++    }
++    s->cr = 0;
++    s->isr = 0;
++    s->ier = 0;
++    s->dgier = 0;
++    s->rfd = 0;
++    s->in_xfer = false;
++    s->is_recv = false;
++    s->stop_pending = false;
++    s->rx_len = 0;
++    s->rx_pos = 0;
++    memset(s->rx_fifo, 0, sizeof(s->rx_fifo));
++}
++
++static uint32_t xlnx_axi_iic_status(XlnxAxiIicState *s)
++{
++    uint32_t sr = XLNX_AXI_IIC_SR_TX_FIFO_EMPTY_MASK;
++
++    sr |= (s->rx_pos >= s->rx_len) ? XLNX_AXI_IIC_SR_RX_FIFO_EMPTY_MASK
++                                   : XLNX_AXI_IIC_SR_RX_FIFO_FULL_MASK;
++    if (s->in_xfer) {
++        sr |= XLNX_AXI_IIC_SR_BUS_BUSY_MASK;
++    }
++    return sr;
++}
++
++static void xlnx_axi_iic_fail(XlnxAxiIicState *s)
++{
++    i2c_end_transfer(s->bus);
++    s->in_xfer = false;
++    s->isr |= XLNX_AXI_IIC_INTR_TX_ERROR_MASK | XLNX_AXI_IIC_INTR_BNB_MASK;
++    xlnx_axi_iic_update_irq(s);
++}
++
++static uint64_t xlnx_axi_iic_read(void *opaque, hwaddr addr, unsigned size)
++{
++    XlnxAxiIicState *s = opaque;
++    bool rx_empty = s->rx_pos >= s->rx_len;
++    uint64_t val = 0;
++
++    switch (addr) {
++    case XLNX_AXI_IIC_SR:
++        val = xlnx_axi_iic_status(s);
++        break;
++    case XLNX_AXI_IIC_IISR:
++        val = s->isr;
++        break;
++    case XLNX_AXI_IIC_IIER:
++        val = s->ier;
++        break;
++    case XLNX_AXI_IIC_DGIER:
++        val = s->dgier;
++        break;
++    case XLNX_AXI_IIC_CR:
++        val = s->cr;
++        break;
++    case XLNX_AXI_IIC_RFD:
++        val = s->rfd;
++        break;
++    case XLNX_AXI_IIC_RFO:
++        val = rx_empty ? 0 : (s->rx_len - s->rx_pos - 1);
++        break;
++    case XLNX_AXI_IIC_DRR:
++        if (!rx_empty) {
++            val = s->rx_fifo[s->rx_pos++];
++            if (s->rx_pos >= s->rx_len) {
++                s->isr &= ~(uint32_t)XLNX_AXI_IIC_INTR_RX_FULL_MASK;
++                if (s->stop_pending) {
++                    s->stop_pending = false;
++                    s->in_xfer = false;
++                    s->isr |= XLNX_AXI_IIC_INTR_BNB_MASK;
++                }
++                xlnx_axi_iic_update_irq(s);
++            }
++        }
++        break;
++    default:
++        break;
++    }
++    return val;
++}
++
++static void xlnx_axi_iic_dtr_write(XlnxAxiIicState *s, uint64_t val)
++{
++    uint16_t word = val & 0xFFFF;
++    bool stop = word & XLNX_AXI_IIC_TX_DYN_STOP_MASK;
++
++    if (word & XLNX_AXI_IIC_TX_DYN_START_MASK) {
++        uint8_t addr8 = word & 0xFF;
++        s->is_recv = addr8 & 1;
++        s->rx_len = 0;
++        s->rx_pos = 0;
++
++        int nack = s->is_recv ? i2c_start_recv(s->bus, addr8 >> 1)
++                              : i2c_start_send(s->bus, addr8 >> 1);
++        s->in_xfer = true;
++        if (nack) {
++            xlnx_axi_iic_fail(s);
++        }
++        return;
++    }
++
++    if (!s->in_xfer) {
++        return;
++    }
++
++    if (s->is_recv) {
++        unsigned room = XLNX_AXI_IIC_RX_FIFO_MAX - s->rx_len;
++        unsigned n = MIN((unsigned)(word & 0xFF), room);
++
++        for (unsigned i = 0; i < n; i++) {
++            s->rx_fifo[s->rx_len++] = i2c_recv(s->bus);
++        }
++        if (stop) {
++            i2c_end_transfer(s->bus);
++            s->stop_pending = true;
++        }
++        if (s->rx_len > 0) {
++            s->isr |= XLNX_AXI_IIC_INTR_RX_FULL_MASK;
++        }
++        xlnx_axi_iic_update_irq(s);
++        return;
++    }
++
++    if (i2c_send(s->bus, word & 0xFF)) {
++        xlnx_axi_iic_fail(s);
++        return;
++    }
++    if (stop) {
++        i2c_end_transfer(s->bus);
++        s->in_xfer = false;
++        s->isr |= XLNX_AXI_IIC_INTR_TX_EMPTY_MASK | XLNX_AXI_IIC_INTR_BNB_MASK;
++    } else {
++        s->isr |= XLNX_AXI_IIC_INTR_TX_EMPTY_MASK;
++    }
++    xlnx_axi_iic_update_irq(s);
++}
++
++static void xlnx_axi_iic_write(void *opaque, hwaddr addr, uint64_t val,
++                               unsigned size)
++{
++    XlnxAxiIicState *s = opaque;
++
++    switch (addr) {
++    case XLNX_AXI_IIC_RESETR:
++        if ((val & 0xf) == XLNX_AXI_IIC_RESET_MASK) {
++            device_cold_reset(DEVICE(s));
++        }
++        break;
++    case XLNX_AXI_IIC_CR:
++        s->cr = val;
++        break;
++    case XLNX_AXI_IIC_DGIER:
++        s->dgier = val;
++        xlnx_axi_iic_update_irq(s);
++        break;
++    case XLNX_AXI_IIC_IIER:
++        s->ier = val;
++        xlnx_axi_iic_update_irq(s);
++        break;
++    case XLNX_AXI_IIC_IISR:
++        s->isr &= ~(uint32_t)val;
++        xlnx_axi_iic_update_irq(s);
++        break;
++    case XLNX_AXI_IIC_RFD:
++        s->rfd = val;
++        break;
++    case XLNX_AXI_IIC_DTR:
++        xlnx_axi_iic_dtr_write(s, val);
++        break;
++    default:
++        break;
++    }
++}
++
++static const MemoryRegionOps xlnx_axi_iic_ops = {
++    .read = xlnx_axi_iic_read,
++    .write = xlnx_axi_iic_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .impl  = { .min_access_size = 1, .max_access_size = 4 },
++    .valid = { .min_access_size = 1, .max_access_size = 4 },
++};
++
++static void xlnx_axi_iic_realize(DeviceState *dev, Error **errp)
++{
++    XlnxAxiIicState *s = XLNX_AXI_IIC(dev);
++
++    memory_region_init_io(&s->mmio, OBJECT(s), &xlnx_axi_iic_ops, s,
++                          TYPE_XLNX_AXI_IIC, XLNX_AXI_IIC_REGS_SIZE);
++    sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->mmio);
++    sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
++    s->bus = i2c_init_bus(dev, s->bus_name ? s->bus_name : "i2c");
++}
++
++static void xlnx_axi_iic_reset_hold(Object *obj, ResetType type)
++{
++    XlnxAxiIicState *s = XLNX_AXI_IIC(obj);
++
++    xlnx_axi_iic_reset_regs(s);
++    xlnx_axi_iic_update_irq(s);
++}
++
++static const VMStateDescription vmstate_xlnx_axi_iic = {
++    .name = TYPE_XLNX_AXI_IIC,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32(cr, XlnxAxiIicState),
++        VMSTATE_UINT32(isr, XlnxAxiIicState),
++        VMSTATE_UINT32(ier, XlnxAxiIicState),
++        VMSTATE_UINT32(dgier, XlnxAxiIicState),
++        VMSTATE_UINT32(rfd, XlnxAxiIicState),
++        VMSTATE_BOOL(in_xfer, XlnxAxiIicState),
++        VMSTATE_BOOL(is_recv, XlnxAxiIicState),
++        VMSTATE_BOOL(stop_pending, XlnxAxiIicState),
++        VMSTATE_UINT8_ARRAY(rx_fifo, XlnxAxiIicState, XLNX_AXI_IIC_RX_FIFO_MAX),
++        VMSTATE_INT32(rx_len, XlnxAxiIicState),
++        VMSTATE_INT32(rx_pos, XlnxAxiIicState),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
++static const Property xlnx_axi_iic_props[] = {
++    DEFINE_PROP_STRING("bus-name", XlnxAxiIicState, bus_name),
++};
++
++static void xlnx_axi_iic_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    ResettableClass *rc = RESETTABLE_CLASS(klass);
++
++    dc->realize = xlnx_axi_iic_realize;
++    dc->vmsd = &vmstate_xlnx_axi_iic;
++    rc->phases.hold = xlnx_axi_iic_reset_hold;
++    dc->desc = "Xilinx AXI IIC controller";
++    set_bit(DEVICE_CATEGORY_MISC, dc->categories);
++    device_class_set_props(dc, xlnx_axi_iic_props);
++}
++
++static const TypeInfo xlnx_axi_iic_info = {
++    .name          = TYPE_XLNX_AXI_IIC,
++    .parent        = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(XlnxAxiIicState),
++    .class_init    = xlnx_axi_iic_class_init,
++};
++
++static void xlnx_axi_iic_register_types(void)
++{
++    type_register_static(&xlnx_axi_iic_info);
++}
++
++type_init(xlnx_axi_iic_register_types)
+diff --git a/include/hw/i2c/xlnx-axi-iic.h b/include/hw/i2c/xlnx-axi-iic.h
+new file mode 100644
+index 0000000000..daa65c4140
+--- /dev/null
++++ b/include/hw/i2c/xlnx-axi-iic.h
+@@ -0,0 +1,69 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++
++#ifndef HW_I2C_XLNX_AXI_IIC_H
++#define HW_I2C_XLNX_AXI_IIC_H
++
++#include "hw/core/sysbus.h"
++#include "hw/i2c/i2c.h"
++#include "qom/object.h"
++
++#define TYPE_XLNX_AXI_IIC "xlnx-axi-iic"
++OBJECT_DECLARE_SIMPLE_TYPE(XlnxAxiIicState, XLNX_AXI_IIC)
++
++#define XLNX_AXI_IIC_REGS_SIZE      0x1000
++#define XLNX_AXI_IIC_RX_FIFO_MAX    256
++
++#define XLNX_AXI_IIC_DGIER          0x1C
++#define XLNX_AXI_IIC_IISR           0x20
++#define XLNX_AXI_IIC_IIER           0x28
++#define XLNX_AXI_IIC_RESETR         0x40
++#define XLNX_AXI_IIC_CR             0x100
++#define XLNX_AXI_IIC_SR             0x104
++#define XLNX_AXI_IIC_DTR            0x108
++#define XLNX_AXI_IIC_DRR            0x10C
++#define XLNX_AXI_IIC_TFO            0x114
++#define XLNX_AXI_IIC_RFO            0x118
++#define XLNX_AXI_IIC_RFD            0x120
++
++#define XLNX_AXI_IIC_RESET_MASK             0xA
++
++#define XLNX_AXI_IIC_SR_BUS_BUSY_MASK       0x04
++#define XLNX_AXI_IIC_SR_RX_FIFO_FULL_MASK   0x20
++#define XLNX_AXI_IIC_SR_RX_FIFO_EMPTY_MASK  0x40
++#define XLNX_AXI_IIC_SR_TX_FIFO_EMPTY_MASK  0x80
++
++#define XLNX_AXI_IIC_INTR_ARB_LOST_MASK     0x01
++#define XLNX_AXI_IIC_INTR_TX_ERROR_MASK     0x02
++#define XLNX_AXI_IIC_INTR_TX_EMPTY_MASK     0x04
++#define XLNX_AXI_IIC_INTR_RX_FULL_MASK      0x08
++#define XLNX_AXI_IIC_INTR_BNB_MASK          0x10
++
++#define XLNX_AXI_IIC_GINTR_ENABLE_MASK      0x80000000UL
++
++#define XLNX_AXI_IIC_TX_DYN_START_MASK      0x0100
++#define XLNX_AXI_IIC_TX_DYN_STOP_MASK       0x0200
++
++struct XlnxAxiIicState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion mmio;
++    qemu_irq irq;
++    I2CBus *bus;
++    char *bus_name;
++
++    uint32_t cr;
++    uint32_t isr;
++    uint32_t ier;
++    uint32_t dgier;
++    uint32_t rfd;
++
++    bool in_xfer;
++    bool is_recv;
++    bool stop_pending;
++
++    uint8_t rx_fifo[XLNX_AXI_IIC_RX_FIFO_MAX];
++    int rx_len;
++    int rx_pos;
++};
++
++#endif
+-- 
+2.50.1
+
