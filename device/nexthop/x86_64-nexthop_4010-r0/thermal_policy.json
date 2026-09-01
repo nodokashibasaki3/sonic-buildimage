@@ -16,7 +16,9 @@
             "name": "Two or fewer fan drawers present",
             "conditions": [
                 {
-                    "type": "fandrawer.two.or.fewer.present"
+                    "type": "fandrawer.presence",
+                    "op": "<=",
+                    "count": 2
                 }
             ],
             "actions": [
@@ -25,7 +27,7 @@
                     "max_speed": 100
                 },
                 {
-                    "type": "fan.set_speed",
+                    "type": "fan.all.set_speed",
                     "speed": 100
                 }
             ]
@@ -34,7 +36,9 @@
             "name": "thermal control algorithm",
             "conditions": [
                 {
-                    "type": "default.operation"
+                    "type": "fandrawer.presence",
+                    "op": ">",
+                    "count": 2
                 }
             ],
             "actions": [
