@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Any, Union
 from sonic_platform_base.sonic_thermal_control.thermal_action_base import ThermalPolicyActionBase
 from sonic_platform_base.sonic_thermal_control.thermal_json_object import thermal_json_object
 from sonic_platform_base.sonic_thermal_control.pid_controller import PIDController
+from sonic_platform_base.sonic_thermal_control.thermal_config import (
+    get_domain_setpoint, get_fan_limits, get_interval, get_pid_domains, load_thermal_config)
 
 if TYPE_CHECKING:
     from sonic_platform_base.fan_base import Fan
@@ -183,6 +185,7 @@ class ThermalControlAlgorithmAction(ThermalPolicyActionBase, NhLoggerMixin):
         self._pidControllers: Dict[str, 'PIDController'] = {}
         self._extra_setpoint_margin: Dict[str, float] = {}
         self._last_run_timestamp: Optional[float] = None
+        self._config: Dict[str, Any] = {}
 
         self.log_debug("Initialized")
 
@@ -198,15 +201,17 @@ class ThermalControlAlgorithmAction(ThermalPolicyActionBase, NhLoggerMixin):
             ValueError: If JSON validation fails
         """
         try:
-            self._pidDomains = algo_json['pid_domains']
-            self._constants = algo_json['constants']
-            self._fan_limits = algo_json['fan_limits']
-        except KeyError as e:
-            self.log_error(f"Missing required fields in JSON: {e}")
-            raise
+            self._config = load_thermal_config()
         except Exception as e:
-            self.log_error(f"Failed to load from JSON: {e}")
+            self.log_error(f"Failed to load thermal config: {e}")
             raise
+
+        self._pidDomains = algo_json.get('pid_domains') or get_pid_domains(self._config)
+        self._fan_limits = algo_json.get('fan_limits')
+        if self._fan_limits is None:
+            fan_min, fan_max = get_fan_limits(self._config)
+            self._fan_limits = {'min': fan_min, 'max': fan_max}
+        self._constants = algo_json.get('constants') or {'interval': get_interval(self._config)}
 
         self.log_info(f"Initialized with {len(self._pidDomains)} PID domains")
         self.log_debug(f"PID domains: {list(self._pidDomains.keys())}")
@@ -420,7 +425,9 @@ class ThermalControlAlgorithmAction(ThermalPolicyActionBase, NhLoggerMixin):
                 self.log_info(f"Thermal '{thermal.get_name()}' has no temperature reading, skipping")
                 continue
 
-            setpoint = thermal.get_pid_setpoint()
+            setpoint = get_domain_setpoint(self._config, domain)
+            if setpoint is None:
+                setpoint = thermal.get_pid_setpoint()
             if setpoint is None:
                 # If the thermal was just unplugged, we may got the temperature, but not the setpoint
                 self.log_info(f"Thermal '{thermal.get_name()}' has no setpoint, skipping")
