@@ -27,14 +27,14 @@ concurrency:
 
 jobs:
   selftest:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
       QEMU_REF: v11.1.0-rc1
       QEMU_SRC: ${{ github.workspace }}/tools/pddf-qemu-emu/test/qemu
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install QEMU build + runtime dependencies
         run: |
@@ -45,7 +45,7 @@ jobs:
             libglib2.0-dev libpixman-1-dev zlib1g-dev libslirp-dev
 
       - name: Cache ccache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/ccache
           key: ccache-${{ runner.os }}-qemu-${{ env.QEMU_REF }}-${{ hashFiles('tools/pddf-qemu-emu/patches/qemu/*.patch') }}
