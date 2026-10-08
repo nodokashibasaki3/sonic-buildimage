@@ -12,9 +12,10 @@ that are not available in test environments.
 
 import importlib.util
 import os
+import sys
 import types
 
-from unittest.mock import MagicMock, Mock
+from unittest.mock import MagicMock, Mock, patch
 from fixtures.fake_swsscommon import fake_swsscommon_modules
 
 # sonic_platform_base is mocked wholesale below and is not pip-installed in the unit
@@ -37,6 +38,18 @@ def _load_real_module(module_name, relative_path):
     spec.loader.exec_module(module)
     return module
 
+
+SHARED_THERMAL_PACKAGE = "sonic_platform_base.sonic_thermal_control"
+
+# The shared thermal modules this platform is built on, in dependency order: each may import
+# the ones listed before it.
+SHARED_THERMAL_MODULES = [
+    "pid_controller",
+    "thermal_config",
+    "common_infos",
+    "common_conditions",
+    "common_actions",
+]
 
 MOCK_MODULES = [
     # PDDF
@@ -164,6 +177,24 @@ def fake_some_base_modules():
     }
 
 
+def load_shared_thermal_modules(dependencies):
+    """Load the real shared thermal modules on top of the given mocks.
+
+    The platform's thermal infos, conditions and actions are thin imports of these modules,
+    and its behaviour is theirs, so they must be the real implementations rather than mocks.
+    They import one another relatively, so each is made visible while the next one loads.
+    """
+    modules = {}
+    with patch.dict(sys.modules, dependencies):
+        for name in SHARED_THERMAL_MODULES:
+            full_name = "{}.{}".format(SHARED_THERMAL_PACKAGE, name)
+            module = _load_real_module(
+                full_name, os.path.join("sonic_platform_base", "sonic_thermal_control", name + ".py"))
+            sys.modules[full_name] = module
+            modules[full_name] = module
+    return modules
+
+
 def dependencies_dict() -> dict[str, types.ModuleType]:
     """Returns a dictionary of mocked/faked dependencies for unit tests.
 
@@ -178,10 +209,6 @@ def dependencies_dict() -> dict[str, types.ModuleType]:
     results.update(mock_syslog_modules())
     results.update(fake_some_base_modules())
     results.update(fake_swsscommon_modules())
-    # This platform depends on the shared PID controller's behaviour, not just its
-    # interface, so use the real implementation.
-    results["sonic_platform_base.sonic_thermal_control.pid_controller"] = _load_real_module(
-        "sonic_platform_base.sonic_thermal_control.pid_controller",
-        os.path.join("sonic_platform_base", "sonic_thermal_control", "pid_controller.py"))
+    results.update(load_shared_thermal_modules(results))
     return results
 
