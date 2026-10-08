@@ -1,1 +1,3 @@
 test/qemu/
+# The guest initramfs is a test fixture; the top-level .gitignore excludes *.gz.
+!test/fixtures/initramfs.cpio.gz
