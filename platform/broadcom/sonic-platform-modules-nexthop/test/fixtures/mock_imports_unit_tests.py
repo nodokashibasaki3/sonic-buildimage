@@ -10,6 +10,7 @@ This module provides functions to set up mocks for dependencies
 that are not available in test environments.
 """
 
+import contextlib
 import importlib.util
 import os
 import sys
@@ -211,6 +212,36 @@ def load_shared_thermal_modules(dependencies):
             sys.modules[full_name] = module
             modules[full_name] = module
     return modules
+
+
+@contextlib.contextmanager
+def real_thermal_control_package():
+    """Make the whole real sonic_thermal_control package importable inside the block.
+
+    The mocks above leave thermal_json_object and thermal_manager_base fake, so no policy
+    type is ever registered and no policy file could be loaded. Inside this block the package
+    and every submodule are the real ones, freshly loaded, so the type registry starts empty
+    each time. On exit sys.modules is restored, mocks included.
+    """
+    package_dir = os.path.join(
+        _SONIC_PLATFORM_COMMON, "sonic_platform_base", "sonic_thermal_control")
+    init_path = os.path.join(package_dir, "__init__.py")
+    if not os.path.exists(init_path):
+        raise RuntimeError(
+            f"cannot find {init_path}; unit tests need the "
+            "sonic-platform-common source tree alongside this platform package")
+    with patch.dict(sys.modules):
+        for name in [n for n in sys.modules
+                     if n == SHARED_THERMAL_PACKAGE or n.startswith(SHARED_THERMAL_PACKAGE + ".")]:
+            del sys.modules[name]
+        # A real package with a real __path__, so its submodules and their relative imports
+        # resolve to the source tree rather than to attributes of the mocked parent.
+        spec = importlib.util.spec_from_file_location(
+            SHARED_THERMAL_PACKAGE, init_path, submodule_search_locations=[package_dir])
+        package = importlib.util.module_from_spec(spec)
+        sys.modules[SHARED_THERMAL_PACKAGE] = package
+        spec.loader.exec_module(package)
+        yield package
 
 
 def dependencies_dict() -> dict[str, types.ModuleType]:
