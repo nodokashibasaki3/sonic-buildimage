@@ -312,3 +312,39 @@ class TestSfpThermal:
             # Values should remain cached (unchanged)
             assert sfp_th.get_high_threshold() == 75.0
             assert sfp_th.get_low_threshold() == 10.5
+
+
+class TestPidHooks:
+    """The PID hooks on ThermalBase default to None; the platform's own must win."""
+
+    @pytest.mark.parametrize("class_name", ["Thermal", "NexthopFpgaAsicThermal", "SfpThermal"])
+    def test_pid_domain_comes_from_the_mixin(self, thermal_module, class_name):
+        # Given a platform thermal class, which also inherits ThermalBase's default hooks
+        cls = getattr(thermal_module, class_name)
+
+        # When its get_pid_domain is resolved
+        # Then it is the mixin's, which reads the domain from the PDDF data
+        assert cls.get_pid_domain is thermal_module.PidThermalMixin.get_pid_domain
+
+    @pytest.mark.parametrize("class_name", ["Thermal", "NexthopFpgaAsicThermal"])
+    def test_pid_setpoint_comes_from_the_mixin(self, thermal_module, class_name):
+        # Given a platform thermal class that does not define its own setpoint
+        cls = getattr(thermal_module, class_name)
+
+        # When its get_pid_setpoint is resolved
+        # Then it is the mixin's, which derives the setpoint from the high threshold
+        assert cls.get_pid_setpoint is thermal_module.PidThermalMixin.get_pid_setpoint
+
+    @pytest.mark.parametrize("domain", ["main", None])
+    def test_sfp_thermal_reports_the_configured_domain(self, thermal_module, domain):
+        # Given transceiver PDDF data with or without a PID domain
+        platform = types.SimpleNamespace(data={'PLATFORM': {
+            'nexthop_thermal_xcvr_pid_domain': domain}})
+        sfp = Mock()
+        sfp.get_position_in_parent.return_value = 1
+
+        # When a transceiver thermal is built from it
+        sfp_th = thermal_module.SfpThermal(sfp, platform)
+
+        # Then its PID domain is the configured one, or None when it is not PID-controlled
+        assert sfp_th.get_pid_domain() == domain

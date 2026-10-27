@@ -23,10 +23,6 @@
             ],
             "actions": [
                 {
-                    "type": "fan.set_max_speed",
-                    "max_speed": 100
-                },
-                {
                     "type": "fan.all.set_speed",
                     "speed": 100
                 }
@@ -43,11 +39,8 @@
             ],
             "actions": [
                 {
-                    "type": "fan.set_max_speed",
+                    "type": "thermal.control_algo",
                     "max_speed": 75
-                },
-                {
-                    "type": "thermal.control_algo"
                 }
             ]
         }

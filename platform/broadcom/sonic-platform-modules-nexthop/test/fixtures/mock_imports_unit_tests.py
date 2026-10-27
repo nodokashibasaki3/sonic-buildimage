@@ -148,14 +148,8 @@ def fake_some_base_modules():
     thermal_condition_base.ThermalPolicyConditionBase = type(
         "ThermalPolicyConditionBase", (object,), {})
 
-    thermal_base = Mock()
-    thermal_base.ThermalBase = type("ThermalBase", (object,), {})
-
     watchdog_base = Mock()
     watchdog_base.WatchdogBase = type("WatchdogBase", (object,), {})
-
-    pddf_thermal = Mock()
-    pddf_thermal.PddfThermal = type("PddfThermal", (object,), {})
 
     led_control_base = Mock()
     led_control_base.LedControlBase = type("LedControlBase", (object,), {})
@@ -170,11 +164,34 @@ def fake_some_base_modules():
         "sonic_platform_base.sonic_thermal_control.thermal_info_base": thermal_info_base,
         "sonic_platform_base.sonic_thermal_control.thermal_action_base": thermal_action_base,
         "sonic_platform_base.sonic_thermal_control.thermal_condition_base": thermal_condition_base,
-        "sonic_platform_base.thermal_base": thermal_base,
         "sonic_platform_base.watchdog_base": watchdog_base,
-        "sonic_platform_pddf_base.pddf_thermal": pddf_thermal,
         "sonic_led.led_control_base": led_control_base,
         "sonic_py_common.interface": interface_mock,
+    }
+
+
+def load_real_thermal_base(dependencies):
+    """Load the real ThermalBase, and a fake PddfThermal built on it as the real one is.
+
+    ThermalBase provides default PID hooks, so the platform's thermals are only right if
+    their own hooks win over it in the method resolution order. A fake ThermalBase would
+    hide that.
+    """
+    device_base = _load_real_module(
+        "sonic_platform_base.device_base", os.path.join("sonic_platform_base", "device_base.py"))
+    # thermal_base does "from . import device_base", which reads it off the mocked package.
+    dependencies["sonic_platform_base"].device_base = device_base
+    with patch.dict(sys.modules, dependencies):
+        thermal_base = _load_real_module(
+            "sonic_platform_base.thermal_base", os.path.join("sonic_platform_base", "thermal_base.py"))
+
+    pddf_thermal = Mock()
+    pddf_thermal.PddfThermal = type("PddfThermal", (thermal_base.ThermalBase,), {})
+
+    return {
+        "sonic_platform_base.device_base": device_base,
+        "sonic_platform_base.thermal_base": thermal_base,
+        "sonic_platform_pddf_base.pddf_thermal": pddf_thermal,
     }
 
 
@@ -210,6 +227,7 @@ def dependencies_dict() -> dict[str, types.ModuleType]:
     results.update(mock_syslog_modules())
     results.update(fake_some_base_modules())
     results.update(fake_swsscommon_modules())
+    results.update(load_real_thermal_base(results))
     results.update(load_shared_thermal_modules(results))
     return results
 
