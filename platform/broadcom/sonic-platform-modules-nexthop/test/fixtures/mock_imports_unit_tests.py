@@ -49,6 +49,7 @@ SHARED_THERMAL_MODULES = [
     "common_infos",
     "common_conditions",
     "common_actions",
+    "pid_thermal_manager_base",
 ]
 
 MOCK_MODULES = [
@@ -180,8 +181,8 @@ def fake_some_base_modules():
 def load_shared_thermal_modules(dependencies):
     """Load the real shared thermal modules on top of the given mocks.
 
-    The platform's thermal infos, conditions and actions are thin imports of these modules,
-    and its behaviour is theirs, so they must be the real implementations rather than mocks.
+    The platform's thermal manager is built on these modules and its behaviour is theirs,
+    so they must be the real implementations rather than mocks.
     They import one another relatively, so each is made visible while the next one loads.
     """
     modules = {}
